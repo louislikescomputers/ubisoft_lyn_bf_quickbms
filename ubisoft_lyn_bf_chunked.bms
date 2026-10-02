@@ -1,0 +1,211 @@
+# Ubisoft LyN engine .bf/.bf*/.bbf unpacker
+#
+# Fully working:
+#  - ABBA: You Can Dance [Wii]
+#  - The Black Eyed Peas Experience [Wii]
+#  - Just Dance 2, 3, 4, Wii and Wii 2 [Wii]
+#  - Just Dance 3 and 4 [PS3]
+#  - Just Dance 4 [Wii U/X360]
+#  - Just Dance Greatest Hits and Summer Party [Wii]
+#  - Michael Jackson: The Experience [PS3/Wii]
+#
+# Partially working:
+#  - The Adventures of Tintin: The Game [Wii]
+#    The .bik.bf and .wav.bf archives can be fully extracted but some files
+#    from the main .bf archive uses an unknown compression format and are
+#    extracted as is.
+#
+#  - From Dust [PS3]
+#    The Tex_* and Wor_* archives can be fully extracted but offset calculation
+#    for some files from the Gen_Common.lin.bf archive is wrong, prematurely
+#    ending the script with an extraction error.
+#
+#  - Red Steel 2 [Wii]
+#    The .bik.bf and .sns.bf archives can be fully extracted but the file size
+#    calculation for some compressed files from the main .bf archive is wrong,
+#    ending the script prematurely unless SKIP_DECOMP flag below is set to 1,
+#    which will force all compressed files to be extracted as is.
+#
+# Untested:
+#  - The Adventures of Tintin: The Game [3DS/PC/PS3/X360]
+#  - From Dust [PC/X360]
+#  - Zombi [PC/PS4/XOne]
+#  - ZombiU [Wii U]
+#  - Any other game made with Ubisoft's LyN engine not listed here
+#
+# Written by mbc07 on August 21, 2021
+# Last updated on September 5, 2021 (v0.8) [BETA]
+#
+# MODIFIED (untested): type 4/5 entries are now handled as multi-chunk LZO
+# (one LZO stream per chunk, sizes listed in a block table) instead of a single
+# stream, following the chunk logic of tintin.bms. Falls back to extracting
+# as is if the block table doesn't add up.
+
+# Script settings
+Math SKIP_DECOMP = 0
+Math CHUNK_SIZE  = 0x40000   # decompressed size of one LZO chunk
+Math VERBOSE     = 0         # 1 = print layout/chunk count per compressed file
+
+#------------------------------------------------------------------------------
+ComType lzo1x
+IDString "ABE"
+
+GoTo 0x15 0 SEEK_CUR
+Get FIRST_TABLE long
+GoTo 0x10 0 SEEK_CUR
+Get FILE_COUNT long
+
+GoTo FIRST_TABLE
+For
+    # A .bf archive might have multiple file tables. Get the number of entries
+    # from current table and the offset of the next table for use later.
+    Get TABLE_ENTRIES long
+    GoTo 0x4 0 SEEK_CUR
+    Get NEXT_TABLE long
+
+    # Make sure to not process more entries than the remaining file count, as
+    # those extra entries always point to invalid offsets and random data.
+    If TABLE_ENTRIES > FILE_COUNT
+        Math TABLE_ENTRIES = FILE_COUNT
+    EndIf
+
+    # Loop through the current file table
+    For I = 0 < TABLE_ENTRIES
+        GetDString FILENAME 0x50
+        GoTo 0x18 0 SEEK_CUR
+        Get OFFSET_HIGH long
+        Get OFFSET_LOW long
+        GoTo 0x58 0 SEEK_CUR
+        SavePos TABLE_OFFSET
+
+        # The file offset is stored in two 32-bit fields. OFFSET_HIGH is always
+        # 0 on <4 GB archives, otherwise it increases by 1 every 4 GB of data.
+        XMath OFFSET "(OFFSET_HIGH * 0x100000000) + OFFSET_LOW"
+        GoTo OFFSET
+
+        Get SIZE1 long
+        Get SIZE2 long
+        GoTo 0x4 0 SEEK_CUR
+        Get TYPE long
+
+        Math OFFSET += 0x20
+        GoTo OFFSET
+
+        If TYPE == 0x3
+            # Current file is a shadow file. Shadow files have a fixed size of
+            # 1024 bytes and references an external file, normally an audio or
+            # video asset stored on a separate .bf archive.
+            #
+            # Override SIZE2 with SIZE1 to prevent misdetection of shadow files
+            # as a compressed file type later on.
+            Math SIZE2 = SIZE1
+        EndIf
+
+        If SIZE2 > 0
+            If SIZE1 == SIZE2
+                # Audio assets carry an additional 0x18 metadata block that is
+                # not part of the actual file. Skip that block if applicable.
+                GetDString HEADER 0x4
+                If HEADER == "LySE"
+                    Math OFFSET += 0x14
+                    Math SIZE2  -= 0x14
+                EndIf
+
+                Log FILENAME OFFSET SIZE2
+            Else
+                # If SIZE1 and SIZE2 differs, the current file is compressed.
+                If SKIP_DECOMP != 1
+                    If TYPE == 0x4 || TYPE == 0x5
+                        # Chunked LZO. The block table at the start of the
+                        # payload holds one compressed size per chunk, and each
+                        # chunk is its own LZO stream that expands to at most
+                        # CHUNK_SIZE bytes (same approach as aluigi's tintin.bms).
+                        #
+                        # Two table layouts are known, so try both and keep the
+                        # one whose sizes add up to the stored compressed size:
+                        #   0) [dummy][CHUNKS][ZSIZE * CHUNKS]
+                        #   1) [CHUNKS][ZSIZE * CHUNKS]
+                        Math OK = 0
+                        For LAY = 0 < 2
+                            If OK == 0
+                                GoTo OFFSET
+                                If LAY == 0
+                                    Get DUMMY long
+                                    Math HDR = 8
+                                Else
+                                    Math HDR = 4
+                                EndIf
+                                Get CHUNKS long
+                                If CHUNKS u> 0
+                                    If CHUNKS u< 0x10000
+                                        Math SUM = 0
+                                        For CK = 0 < CHUNKS
+                                            Get ZS long
+                                            PutArray 0 CK ZS
+                                            Math SUM += ZS
+                                        Next CK
+                                        XMath HDR   "HDR + (CHUNKS * 4)"
+                                        XMath TOTAL "HDR + SUM"
+                                        If TOTAL <= SIZE1
+                                            XMath SLACK "SIZE1 - TOTAL"
+                                            If SLACK < 0x800
+                                                Math OK = 1
+                                            EndIf
+                                        EndIf
+                                    EndIf
+                                EndIf
+                            EndIf
+                        Next LAY
+
+                        If OK == 1
+                            If VERBOSE == 1
+                                Print "%FILENAME%: type %TYPE% chunks %CHUNKS% header %HDR%"
+                            EndIf
+
+                            Math CHUNK_OUT = CHUNK_SIZE
+                            If SIZE2 < CHUNK_OUT
+                                Math CHUNK_OUT = SIZE2
+                            EndIf
+
+                            XMath PAYLOAD "OFFSET + HDR"
+                            Log FILENAME 0 0
+                            Append
+                            GoTo PAYLOAD
+                            For CK = 0 < CHUNKS
+                                GetArray ZS 0 CK
+                                SavePos CPOS
+                                Clog FILENAME CPOS ZS CHUNK_OUT
+                                GoTo ZS 0 SEEK_CUR
+                            Next CK
+                            Append
+                        Else
+                            Print "Unrecognized block table, extracting as is: %FILENAME%"
+                            Log FILENAME OFFSET SIZE1
+                        EndIf
+                    Elif TYPE > 0x4
+                        Print "Unknown compression, extracting as is: %FILENAME%"
+                        Log FILENAME OFFSET SIZE1
+                    Else
+                        Clog FILENAME OFFSET SIZE1 SIZE2
+                    EndIf
+                Else
+                    Print "SKIP_DECOMP flag is set, extracting as is: %FILENAME%"
+                    Log FILENAME OFFSET SIZE1
+                EndIf
+            EndIf
+        Else
+            Print "Empty file, skipping: %FILENAME%"
+        EndIf
+
+        GoTo TABLE_OFFSET
+    Next I
+
+    # Decrease the number of files extracted from the current table from the
+    # remaining file count and break out of the loop if applicable.
+    Math FILE_COUNT -= I
+    If FILE_COUNT > 0
+        GoTo NEXT_TABLE
+    Else
+        Break
+    EndIf
+Next
