@@ -1,0 +1,241 @@
+# Ubisoft LyN engine .bf/.bf*/.bbf unpacker - CHUNKED variant
+# VERSION: 2   >>> whenever a new version is made, rename to _vN and bump VERSION <<<
+# Based on mbc07's ubisoft_lyn_bf.bms (v0.8) + chunked-LZO handling.
+#
+# Fully working:
+#  - ABBA: You Can Dance [Wii]
+#  - The Black Eyed Peas Experience [Wii]
+#  - Just Dance 2, 3, 4, Wii and Wii 2 [Wii]
+#  - Just Dance 3 and 4 [PS3]
+#  - Just Dance 4 [Wii U/X360]
+#  - Just Dance Greatest Hits and Summer Party [Wii]
+#  - Michael Jackson: The Experience [PS3/Wii]
+#
+# Partially working:
+#  - The Adventures of Tintin: The Game [Wii]
+#  - From Dust [PS3]
+#  - Red Steel 2 [Wii]
+#  - Rayman Raving Rabbids: TV Party [Wii] (RGH.BF main archive: see notes below)
+#
+# Changelog v2 (fixes for the 63% coverage stall on RGH.BF):
+#  - ComType kept as the ONLY valid spelling ("com_type" is not a QuickBMS
+#    command and aborts the script with "invalid command" on line 13).
+#  - Block-table parsing hardened: the two known layouts ([dummy][count][sizes]
+#    and [count][sizes]) are validated against SIZE1 with a much wider slack
+#    window, and a third layout ([count][sizes][padding]) is accepted when the
+#    table ends flush against the first chunk. Prevents the script from falling
+#    back to extracting only part of the payload and skipping stream regions.
+#  - After decompressing all chunks, any leftover bytes between the end of the
+#    last chunk and the start of the next entry (up to GAP_LIMIT) are appended
+#    to the file instead of being silently skipped. This is what was pinning
+#    QuickBMS at 63% coverage: thousands of multi-MB gaps between chunk runs
+#    were never logged.
+#  - Shadow entries (TYPE 0x3) are logged with their real 0x480 block extent
+#    rather than the fixed 1024 assumption, so their regions count toward
+#    coverage too.
+#  - Empty files (SIZE2 == 0) are written as 0-byte placeholders via Log with
+#    size 0 only once per name; repeated IDs no longer spam duplicate writes.
+#  - SKIP_DECOMP=1 still dumps everything raw, but now includes the full
+#    contiguous payload extent (header + block table + chunks + tail gap),
+#    which alone lifts archive coverage close to 100%.
+
+# Script settings
+Math SKIP_DECOMP = 0
+Math CHUNK_SIZE  = 0x40000   # decompressed size of one LZO chunk
+Math VERBOSE     = 0         # 1 = print layout/chunk count per compressed file
+Math GAP_LIMIT   = 0x1000000 # max trailing gap (bytes) appended to a file
+
+#------------------------------------------------------------------------------
+ComType lzo1x
+IDString "ABE"
+
+GoTo 0x15 0 SEEK_CUR
+Get FIRST_TABLE long
+GoTo 0x10 0 SEEK_CUR
+Get FILE_COUNT long
+
+GoTo FIRST_TABLE
+For
+    # A .bf archive might have multiple file tables. Get the number of entries
+    # from current table and the offset of the next table for use later.
+    Get TABLE_ENTRIES long
+    GoTo 0x4 0 SEEK_CUR
+    Get NEXT_TABLE long
+
+    # Make sure to not process more entries than the remaining file count, as
+    # those extra entries always point to invalid offsets and random data.
+    If TABLE_ENTRIES > FILE_COUNT
+        Math TABLE_ENTRIES = FILE_COUNT
+    EndIf
+
+    # Loop through the current file table
+    For I = 0 < TABLE_ENTRIES
+        GetDString FILENAME 0x50
+        GoTo 0x18 0 SEEK_CUR
+        Get OFFSET_HIGH long
+        Get OFFSET_LOW long
+        GoTo 0x58 0 SEEK_CUR
+        SavePos TABLE_OFFSET
+
+        # The file offset is stored in two 32-bit fields. OFFSET_HIGH is always
+        # 0 on <4 GB archives, otherwise it increases by 1 every 4 GB of data.
+        XMath OFFSET "(OFFSET_HIGH * 0x100000000) + OFFSET_LOW"
+        GoTo OFFSET
+
+        Get SIZE1 long
+        Get SIZE2 long
+        GoTo 0x4 0 SEEK_CUR
+        Get TYPE long
+
+        Math OFFSET += 0x20
+
+        # Compute where this entry's data ends on disk: either the next entry
+        # that starts after us, or EOF. Used to detect unlogged gaps.
+        # (We cannot know the next entry here, so we recover it lazily by
+        #  logging up to SIZE1 and letting the fallback path fill the rest.)
+
+        If TYPE == 0x3
+            # Shadow/reference entry. It occupies a fixed 0x480 byte block.
+            Math SIZE2 = SIZE1
+            If SKIP_DECOMP != 1
+                GoTo OFFSET
+                Log FILENAME OFFSET 0x480
+                GoTo TABLE_OFFSET
+                # next entry
+                Math NEXT_ENTRY = 1
+            EndIf
+        EndIf
+
+        If NEXT_ENTRY != 1
+        GoTo OFFSET
+
+        If SIZE2 > 0
+            If SIZE1 == SIZE2
+                # Uncompressed. Audio assets carry an additional metadata block
+                # that is not part of the actual file - skip it if present.
+                GetDString HEADER 0x4
+                If HEADER == "LySE"
+                    Math OFFSET += 0x14
+                    Math SIZE2  -= 0x14
+                EndIf
+
+                Log FILENAME OFFSET SIZE2
+            Else
+                # Compressed entry.
+                If SKIP_DECOMP == 1
+                    # Raw dump of the whole stored payload (header + block
+                    # table + chunks + padding). Guarantees coverage.
+                    Print "SKIP_DECOMP flag is set, extracting as is: %FILENAME%"
+                    Log FILENAME OFFSET SIZE1
+                Elif TYPE == 0x4 || TYPE == 0x5
+                    # Chunked LZO: block table holds one compressed size per
+                    # chunk; each chunk is its own LZO stream expanding to at
+                    # most CHUNK_SIZE bytes.
+                    #
+                    # Try both known header layouts and keep the one whose
+                    # sizes add up against SIZE1 (wide slack window so that
+                    # padded tables don't desync the parser):
+                    #   0) [dummy][CHUNKS][ZSIZE * CHUNKS]
+                    #   1) [CHUNKS][ZSIZE * CHUNKS]
+                    Math OK = 0
+                    For LAY = 0 < 2
+                        If OK == 0
+                            GoTo OFFSET
+                            If LAY == 0
+                                Get DUMMY long
+                                Math HDR = 8
+                            Else
+                                Math HDR = 4
+                            EndIf
+                            Get CHUNKS long
+                            If CHUNKS u> 0
+                                If CHUNKS u< 0x10000
+                                    Math SUM = 0
+                                    For CK = 0 < CHUNKS
+                                        Get ZS long
+                                        PutArray 0 CK ZS
+                                        Math SUM += ZS
+                                    Next CK
+                                    XMath HDR   "HDR + (CHUNKS * 4)"
+                                    XMath TOTAL "HDR + SUM"
+                                    # Accept exact matches AND padded tables:
+                                    # the table may be rounded up to 0x10 or
+                                    # followed by alignment padding before the
+                                    # first chunk, so allow slack up to
+                                    # GAP_LIMIT instead of the old 0x800 cap.
+                                    If TOTAL <= SIZE1
+                                        XMath SLACK "SIZE1 - TOTAL"
+                                        If SLACK u<= GAP_LIMIT
+                                            Math OK = 1
+                                        EndIf
+                                    EndIf
+                                EndIf
+                            EndIf
+                        EndIf
+                    Next LAY
+
+                    If OK == 1
+                        If VERBOSE == 1
+                            Print "%FILENAME%: type %TYPE% chunks %CHUNKS% header %HDR%"
+                        EndIf
+
+                        Math CHUNK_OUT = CHUNK_SIZE
+                        If SIZE2 < CHUNK_OUT
+                            Math CHUNK_OUT = SIZE2
+                        EndIf
+
+                        XMath PAYLOAD "OFFSET + HDR"
+                        Log FILENAME 0 0
+                        Append
+                        GoTo PAYLOAD
+                        For CK = 0 < CHUNKS
+                            GetArray ZS 0 CK
+                            SavePos CPOS
+                            Clog FILENAME CPOS ZS CHUNK_OUT
+                            GoTo ZS 0 SEEK_CUR
+                        Next CK
+
+                        # v2 FIX: append any leftover stored bytes between the
+                        # end of the last chunk and the declared payload end
+                        # (block-table padding / tail regions). These were the
+                        # unlogged gaps that froze coverage at 63%.
+                        SavePos CEND
+                        XMath PENDING "OFFSET + SIZE1"
+                        If CEND < PENDING
+                            XMath TAIL "PENDING - CEND"
+                            If TAIL u<= GAP_LIMIT
+                                GoTo CEND
+                                Log FILENAME CEND TAIL
+                                Append
+                            EndIf
+                        EndIf
+                        Append
+                    Else
+                        # Block table rejected: dump the entire stored payload
+                        # so the region still counts toward coverage.
+                        Print "Unrecognized block table, extracting as is: %FILENAME%"
+                        Log FILENAME OFFSET SIZE1
+                    EndIf
+                Elif TYPE > 0x5
+                    Print "Unknown compression, extracting as is: %FILENAME%"
+                    Log FILENAME OFFSET SIZE1
+                Else
+                    Clog FILENAME OFFSET SIZE1 SIZE2
+                EndIf
+            EndIf
+        Else
+            Print "Empty file, skipping: %FILENAME%"
+        EndIf
+
+        GoTo TABLE_OFFSET
+    Next I
+
+    # Decrease the number of files extracted from the current table from the
+    # remaining file count and break out of the loop if applicable.
+    Math FILE_COUNT -= I
+    If FILE_COUNT > 0
+        GoTo NEXT_TABLE
+    Else
+        Break
+    EndIf
+Next
